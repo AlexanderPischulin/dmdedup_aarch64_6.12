@@ -13,6 +13,9 @@
 #include "dm-dedup-target.h"
 #include "dm-dedup-rw.h"
 #include "dm-dedup-kvstore.h"
+#include <linux/dynamic_debug.h>
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #define DMD_IO_SIZE	4096
 
@@ -39,14 +42,14 @@ static int fetch_whole_block(struct dedup_config *dc,
 	where.sector = pbn;
 	where.count = dc->sectors_per_block;
 
-	iorq.bi_rw = READ;
+	iorq.bi_opf = READ;
 	iorq.mem.type = DM_IO_PAGE_LIST;
 	iorq.mem.ptr.pl = pl;
 	iorq.mem.offset = 0;
 	iorq.notify.fn = NULL;
 	iorq.client = dc->io_client;
 
-	return dm_io(&iorq, 1, &where, &error_bits);
+	return dm_io(&iorq, 1, &where, &error_bits, 0);
 }
 
 static void merge_data(struct dedup_config *dc, struct page *page,
@@ -85,27 +88,26 @@ static void copy_pages(struct page *src, struct bio *clone)
 	memmove(dest_page_vaddr, src_page_vaddr, DMD_IO_SIZE);
 }
 
-static void my_endio(struct bio *clone, int error)
+static void my_endio(struct bio *clone)
 {
 	unsigned rw = bio_data_dir(clone);
-	struct bio *orig;
-	struct bio_vec *bv;
+	struct bio *orig = clone->bi_private;
 
-	if (!error && !bio_flagged(clone, BIO_UPTODATE))
-		error = -EIO;
+	if (clone->bi_status != BLK_STS_OK)
+		orig->bi_status = clone->bi_status;
+	else
+		orig->bi_status = BLK_STS_OK;
 
 	/* free the processed pages */
 	if (rw == WRITE || rw == READ) {
-		bv = clone->bi_io_vec;
+		struct bio_vec *bv = clone->bi_io_vec;
 		if (bv->bv_page) {
 			free_pages((unsigned long)page_address(bv->bv_page), 0);
 			bv->bv_page = NULL;
 		}
 	}
 
-	orig = clone->bi_private;
-	bio_endio(orig, 0);
-
+	bio_endio(orig);
 	bio_put(clone);
 }
 
@@ -119,8 +121,8 @@ static struct bio *create_bio(struct dedup_config *dc,
 	if (!clone)
 		goto out;
 
-	clone->bi_bdev = bio->bi_bdev;
-	clone->bi_rw = bio->bi_rw;
+	bio_set_dev(clone, dc->data_dev->bdev);
+	clone->bi_opf = bio->bi_opf;
 	clone->bi_iter.bi_sector = compute_sector(bio, dc);
 	clone->bi_private = bio;  /* for later completion */
 	clone->bi_end_io = my_endio;
@@ -199,18 +201,15 @@ static struct bio *prepare_bio_without_pbn(struct dedup_config *dc,
 	int r = 0;
 	struct bio *clone = NULL;
 
-	if (!bio_page(bio)) {
-		r = -EINVAL;
-		goto out;
-	}
-
 	clone = create_bio(dc, bio);
 	if (!clone)
 		goto out;
 
 	zero_fill_bio(clone);
 
-	merge_data(dc, bio_page(clone), bio);
+	/* Only merge data if original bio has pages */
+	if (bio_page(bio))
+		merge_data(dc, bio_page(clone), bio);
 
 out:
 	if (r < 0)
@@ -226,6 +225,28 @@ struct bio *prepare_bio_on_write(struct dedup_config *dc, struct bio *bio)
 	uint32_t vsize;
 	struct lbn_pbn_value lbnpbn_value;
 	struct bio *clone;
+
+	if (!dc || !dc->kvs_lbn_pbn) {
+		pr_err("Invalid dc or kvs_lbn_pbn in prepare_bio_on_write: dc=%p, kvs_lbn_pbn=%p",
+		       dc, dc ? dc->kvs_lbn_pbn : NULL);
+		return ERR_PTR(-EINVAL);
+	}
+
+	/* Handle bios without payload or zero-size (e.g., metadata operations from mkfs, fsync) */
+	if (bio->bi_iter.bi_size == 0) {
+		pr_debug("prepare_bio_on_write: bio has zero size (bi_vcnt=%u, bi_idx=%u), passing through",
+		       bio->bi_vcnt, bio->bi_iter.bi_idx);
+		/* Just remap and submit the zero-size bio directly */
+		bio_set_dev(bio, dc->data_dev->bdev);
+		submit_bio(bio);
+		return ERR_PTR(-EAGAIN);  /* Signal that bio was already submitted */
+	}
+
+	if (bio->bi_vcnt == 0 || bio->bi_iter.bi_idx >= bio->bi_vcnt || !bio_page(bio)) {
+		pr_err("prepare_bio_on_write: bio has no pages (bi_vcnt=%u, bi_idx=%u), treating as read-on-write with empty data",
+		      bio->bi_vcnt, bio->bi_iter.bi_idx);
+		return prepare_bio_without_pbn(dc, bio);
+	}
 
 	lbn = compute_sector(bio, dc);
 	(void) sector_div(lbn, dc->sectors_per_block);

@@ -27,10 +27,7 @@
 
 #include <linux/scatterlist.h>
 #include <asm/page.h>
-#include <asm/unaligned.h>
-#include <crypto/hash.h>
-#include <crypto/md5.h>
-#include <crypto/algapi.h>
+#include <linux/unaligned.h>
 
 #include "dm-dedup-target.h"
 
@@ -42,3 +39,4 @@ struct init_param_cowbtree {
 };
 
 #endif /* COWBTREE_BACKEND_H */
+#include <linux/unaligned.h>

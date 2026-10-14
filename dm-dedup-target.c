@@ -12,14 +12,20 @@
 
 #include <linux/vmalloc.h>
 #include <linux/kdev_t.h>
+#include <linux/dynamic_debug.h>
 
 #include "dm-dedup-target.h"
 #include "dm-dedup-rw.h"
 #include "dm-dedup-hash.h"
 #include "dm-dedup-backend.h"
+#include <linux/blkdev.h>
 #include "dm-dedup-ram.h"
+#ifdef CONFIG_DM_DEDUP_COWBTREE
 #include "dm-dedup-cbt.h"
+#endif
 #include "dm-dedup-kvstore.h"
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #define MAX_DEV_NAME_LEN (64)
 
@@ -43,13 +49,16 @@ struct dedup_work {
 
 enum backend {
 	BKND_INRAM,
+#ifdef CONFIG_DM_DEDUP_COWBTREE
 	BKND_COWBTREE
+#endif
 };
 
 static void bio_zero_endio(struct bio *bio)
 {
 	zero_fill_bio(bio);
-	bio_endio(bio, 0);
+	bio->bi_status = BLK_STS_OK;
+	bio_endio(bio);
 }
 
 static uint64_t bio_lbn(struct dedup_config *dc, struct bio *bio)
@@ -63,8 +72,8 @@ static uint64_t bio_lbn(struct dedup_config *dc, struct bio *bio)
 
 static void do_io_remap_device(struct dedup_config *dc, struct bio *bio)
 {
-	bio->bi_bdev = dc->data_dev->bdev;
-	generic_make_request(bio);
+	bio_set_dev(bio, dc->data_dev->bdev);
+	submit_bio(bio);
 }
 
 static void do_io(struct dedup_config *dc, struct bio *bio, uint64_t pbn)
@@ -170,16 +179,16 @@ static int handle_write_no_hash(struct dedup_config *dc,
 
 		goto out_1;
 
-out_inc_refcount_1:
+	out_inc_refcount_1:
 		dc->kvs_hash_pbn->kvs_delete(dc->kvs_hash_pbn,
 				(void *)hash, dc->crypto_key_size);
-out_kvs_insert_1:
+	out_kvs_insert_1:
 		dc->kvs_lbn_pbn->kvs_delete(dc->kvs_lbn_pbn,
 				(void *)&lbn, sizeof(lbn));
 		dc->mdops->dec_refcount(dc->bmd, pbn_new);
-out_write_new_block_1:
+	out_write_new_block_1:
 		dc->newwrites--;
-out_1:
+	out_1:
 		if (r < 0)
 			dc->uniqwrites--;
 		return r;
@@ -202,8 +211,8 @@ out_1:
 	hashpbn_value.pbn = pbn_new;
 
 	r = dc->kvs_hash_pbn->kvs_insert(dc->kvs_hash_pbn, (void *)hash,
-				dc->crypto_key_size, (void *)&hashpbn_value,
-				sizeof(hashpbn_value));
+			dc->crypto_key_size, (void *)&hashpbn_value,
+			sizeof(hashpbn_value));
 	if (r < 0)
 		goto out_kvs_insert_2;
 
@@ -213,23 +222,22 @@ out_1:
 
 	goto out_2;
 
-out_inc_refcount_2:
-	dc->kvs_hash_pbn->kvs_delete(dc->kvs_hash_pbn,
-			(void *)hash, dc->crypto_key_size);
-out_kvs_insert_2:
-	dc->logical_block_counter++;
-	dc->mdops->inc_refcount(dc->bmd, pbn_old);
-out_dec_refcount_2:
-	dc->kvs_lbn_pbn->kvs_insert(dc->kvs_lbn_pbn, (void *)&lbn,
-			sizeof(lbn), (void *)&lbnpbn_value,
-			sizeof(lbnpbn_value));
-	dc->mdops->dec_refcount(dc->bmd, pbn_new);
-out_write_new_block_2:
-	dc->overwrites--;
-out_2:
-	if (r < 0)
-		dc->uniqwrites--;
-	return r;
+	out_inc_refcount_2:
+		dc->kvs_hash_pbn->kvs_delete(dc->kvs_hash_pbn,
+				(void *)hash, dc->crypto_key_size);
+	out_kvs_insert_2:
+		dc->logical_block_counter++;
+		dc->mdops->inc_refcount(dc->bmd, pbn_old);
+	out_dec_refcount_2:
+		dc->kvs_lbn_pbn->kvs_insert(dc->kvs_lbn_pbn, (void *)&lbn,
+				sizeof(lbn), (void *)&lbnpbn_value,
+				sizeof(lbnpbn_value));
+	out_write_new_block_2:
+		dc->overwrites--;
+	out_2:
+		if (r < 0)
+			dc->uniqwrites--;
+		return r;
 }
 
 static int handle_write_with_hash(struct dedup_config *dc, struct bio *bio,
@@ -267,14 +275,15 @@ static int handle_write_with_hash(struct dedup_config *dc, struct bio *bio,
 
 		goto out_1;
 
-out_kvs_insert_1:
+	out_kvs_insert_1:
 		dc->mdops->dec_refcount(dc->bmd, pbn_new);
-out_inc_refcount_1:
+	out_inc_refcount_1:
 		dc->newwrites--;
-out_1:
-		if (r >= 0)
-			bio_endio(bio, 0);
-		else
+	out_1:
+		if (r >= 0) {
+			bio->bi_status = BLK_STS_OK;
+			bio_endio(bio);
+		} else
 			dc->dupwrites--;
 		return r;
 	} else if (r < 0)
@@ -291,8 +300,8 @@ out_1:
 		new_lbnpbn_value.pbn = pbn_new;
 
 		r = dc->kvs_lbn_pbn->kvs_insert(dc->kvs_lbn_pbn, (void *)&lbn,
-			sizeof(lbn), (void *)&new_lbnpbn_value,
-			sizeof(new_lbnpbn_value));
+				sizeof(lbn), (void *)&new_lbnpbn_value,
+				sizeof(new_lbnpbn_value));
 		if (r < 0)
 			goto out_kvs_insert_2;
 
@@ -304,20 +313,21 @@ out_1:
 	/* Nothing to do if writing same data to same LBN */
 	goto out_2;
 
-out_dec_refcount_2:
-	dc->kvs_lbn_pbn->kvs_insert(dc->kvs_lbn_pbn, (void *)&lbn,
-			sizeof(lbn), (void *)&lbnpbn_value,
-			sizeof(lbnpbn_value));
-out_kvs_insert_2:
-	dc->mdops->dec_refcount(dc->bmd, pbn_new);
-out_inc_refcount_2:
-	dc->overwrites--;
-out_2:
-	if (r >= 0)
-		bio_endio(bio, 0);
-	else
-		dc->dupwrites--;
-	return r;
+	out_dec_refcount_2:
+		dc->kvs_lbn_pbn->kvs_insert(dc->kvs_lbn_pbn, (void *)&lbn,
+				sizeof(lbn), (void *)&lbnpbn_value,
+				sizeof(lbnpbn_value));
+	out_kvs_insert_2:
+		dc->mdops->dec_refcount(dc->bmd, pbn_new);
+	out_inc_refcount_2:
+		dc->overwrites--;
+	out_2:
+		if (r >= 0) {
+			bio->bi_status = BLK_STS_OK;
+			bio_endio(bio);
+		} else
+			dc->dupwrites--;
+		return r;
 }
 
 static int handle_write(struct dedup_config *dc, struct bio *bio)
@@ -329,6 +339,12 @@ static int handle_write(struct dedup_config *dc, struct bio *bio)
 	struct bio *new_bio = NULL;
 	int r;
 
+	if (!dc || !dc->kvs_lbn_pbn || !dc->kvs_hash_pbn) {
+		pr_err("Invalid dc or KVS pointers in handle_write: dc=%p, kvs_lbn_pbn=%p, kvs_hash_pbn=%p",
+		       dc, dc ? dc->kvs_lbn_pbn : NULL, dc ? dc->kvs_hash_pbn : NULL);
+		return -EINVAL;
+	}
+
 	dc->writes++;
 
 	/* Read-on-write handling */
@@ -337,8 +353,13 @@ static int handle_write(struct dedup_config *dc, struct bio *bio)
 		new_bio = prepare_bio_on_write(dc, bio);
 		if (!new_bio)
 			return -ENOMEM;
-		else if(IS_ERR(new_bio))
+		else if(IS_ERR(new_bio)) {
+			if (PTR_ERR(new_bio) == -EAGAIN) {
+				/* bio was already submitted in prepare_bio_on_write */
+				return 0;
+			}
 			return PTR_ERR(new_bio);
+		}
 		bio = new_bio;
 	}
 
@@ -349,20 +370,20 @@ static int handle_write(struct dedup_config *dc, struct bio *bio)
 		return r;
 
 	r = dc->kvs_hash_pbn->kvs_lookup(dc->kvs_hash_pbn, hash,
-				dc->crypto_key_size, &hashpbn_value, &vsize);
+			dc->crypto_key_size, &hashpbn_value, &vsize);
 
 	if (r == 0)
 		r = handle_write_no_hash(dc, bio, lbn, hash);
 	else if (r > 0)
 		r = handle_write_with_hash(dc, bio, lbn, hash,
-					hashpbn_value);
+					   hashpbn_value);
 
 	if (r < 0)
 		return r;
 
 	dc->writes_after_flush++;
 	if ((dc->flushrq && dc->writes_after_flush >= dc->flushrq) ||
-			(bio->bi_rw & (REQ_FLUSH | REQ_FUA))) {
+	    bio_op(bio) == REQ_OP_FLUSH) {
 		r = dc->mdops->flush_meta(dc->bmd);
 		if (r < 0)
 			return r;
@@ -376,10 +397,12 @@ static void process_bio(struct dedup_config *dc, struct bio *bio)
 {
 	int r;
 
-	if (bio->bi_rw & (REQ_FLUSH | REQ_FUA) && !bio_sectors(bio)) {
+	/* Handle flush requests - both with and without data */
+	if (bio_op(bio) == REQ_OP_FLUSH) {
 		r = dc->mdops->flush_meta(dc->bmd);
 		if (r == 0)
 			dc->writes_after_flush = 0;
+		/* Pass the flush bio to the underlying device */
 		do_io_remap_device(dc, bio);
 		return;
 	}
@@ -390,10 +413,16 @@ static void process_bio(struct dedup_config *dc, struct bio *bio)
 		break;
 	case WRITE:
 		r = handle_write(dc, bio);
+		break;
+	default:
+		pr_err("process_bio: unknown bio_data_dir=%d", bio_data_dir(bio));
+		r = -EINVAL;
 	}
 
-	if (r < 0)
-		bio_endio(bio, r);
+	if (r < 0) {
+		bio->bi_status = errno_to_blk_status(-r);
+		bio_endio(bio);
+	}
 }
 
 static void do_work(struct work_struct *ws)
@@ -401,6 +430,17 @@ static void do_work(struct work_struct *ws)
 	struct dedup_work *data = container_of(ws, struct dedup_work, worker);
 	struct dedup_config *dc = (struct dedup_config *)data->config;
 	struct bio *bio = (struct bio *)data->bio;
+
+	if (!dc || !dc->kvs_lbn_pbn || !dc->kvs_hash_pbn) {
+		pr_err("Invalid dc or KVS pointers in do_work: dc=%p, kvs_lbn_pbn=%p, kvs_hash_pbn=%p",
+		       dc, dc ? dc->kvs_lbn_pbn : NULL, dc ? dc->kvs_hash_pbn : NULL);
+		if (bio) {
+			bio->bi_status = BLK_STS_IOERR;
+			bio_endio(bio);
+		}
+		mempool_free(data, dc ? dc->dedup_work_pool : NULL);
+		return;
+	}
 
 	mempool_free(data, dc->dedup_work_pool);
 
@@ -413,7 +453,8 @@ static void dedup_defer_bio(struct dedup_config *dc, struct bio *bio)
 
 	data = mempool_alloc(dc->dedup_work_pool, GFP_NOIO);
 	if (!data) {
-		bio_endio(bio, -ENOMEM);
+	bio->bi_status = errno_to_blk_status(ENOMEM);
+	bio_endio(bio);
 		return;
 	}
 
@@ -473,7 +514,7 @@ static int parse_data_dev(struct dedup_args *da, struct dm_arg_set *as,
 	if (r)
 		*err = "Error opening data device";
 	else
-		da->data_size = i_size_read(da->data_dev->bdev->bd_inode);
+		da->data_size = bdev_nr_sectors(da->data_dev->bdev);
 
 	return r;
 }
@@ -484,10 +525,10 @@ static int parse_block_size(struct dedup_args *da, struct dm_arg_set *as,
 	uint32_t block_size;
 
 	if (kstrtou32(dm_shift_arg(as), 10, &block_size) ||
-		!block_size ||
-		block_size < MIN_DATA_DEV_BLOCK_SIZE ||
-		block_size > MAX_DATA_DEV_BLOCK_SIZE ||
-		!is_power_of_2(block_size)) {
+	    !block_size ||
+	    block_size < MIN_DATA_DEV_BLOCK_SIZE ||
+	    block_size > MAX_DATA_DEV_BLOCK_SIZE ||
+	    !is_power_of_2(block_size)) {
 		*err = "Invalid data block size";
 		return -EINVAL;
 	}
@@ -505,9 +546,9 @@ static int parse_block_size(struct dedup_args *da, struct dm_arg_set *as,
 static int parse_hash_algo(struct dedup_args *da, struct dm_arg_set *as,
 			   char **err)
 {
-	strlcpy(da->hash_algo, dm_shift_arg(as), CRYPTO_ALG_NAME_LEN);
+	strscpy(da->hash_algo, dm_shift_arg(as), CRYPTO_ALG_NAME_LEN);
 
-	if (!crypto_has_hash(da->hash_algo, 0, CRYPTO_ALG_ASYNC)) {
+	if (!crypto_has_shash(da->hash_algo, 0, 0)) {
 		*err = "Unrecognized hash algorithm";
 		return -EINVAL;
 	}
@@ -520,18 +561,20 @@ static int parse_backend(struct dedup_args *da, struct dm_arg_set *as,
 {
 	char backend[MAX_BACKEND_NAME_LEN];
 
-	strlcpy(backend, dm_shift_arg(as), MAX_BACKEND_NAME_LEN);
+	strscpy(backend, dm_shift_arg(as), MAX_BACKEND_NAME_LEN);
 
 	if (!strcmp(backend, "inram"))
 		da->backend = BKND_INRAM;
+#ifdef CONFIG_DM_DEDUP_COWBTREE
 	else if (!strcmp(backend, "cowbtree"))
 		da->backend = BKND_COWBTREE;
+#endif
 	else {
 		*err = "Unsupported metadata backend";
 		return -EINVAL;
 	}
 
-	strlcpy(da->backend_str, backend, MAX_BACKEND_NAME_LEN);
+	strscpy(da->backend_str, backend, MAX_BACKEND_NAME_LEN);
 
 	return 0;
 }
@@ -609,7 +652,9 @@ static int dm_dedup_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	struct workqueue_struct *wq;
 
 	struct init_param_inram iparam_inram;
+#ifdef CONFIG_DM_DEDUP_COWBTREE
 	struct init_param_cowbtree iparam_cowbtree;
+#endif
 	void *iparam = NULL;
 	struct metadata *md = NULL;
 
@@ -617,8 +662,7 @@ static int dm_dedup_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	int r;
 	int crypto_key_size;
 
-	struct on_disk_stats d;
-	struct on_disk_stats *data = &d;
+	struct on_disk_stats *data = NULL;
 	uint64_t logical_block_counter = 0;
 	uint64_t physical_block_counter = 0;
 
@@ -648,7 +692,7 @@ static int dm_dedup_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	dedup_work_pool = mempool_create_kmalloc_pool(MIN_DEDUP_WORK_IO,
-						sizeof(struct dedup_work));
+							sizeof(struct dedup_work));
 	if (!dedup_work_pool) {
 		ti->error = "failed to create mempool";
 		r = -ENOMEM;
@@ -668,7 +712,7 @@ static int dm_dedup_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	(void) sector_div(data_size, dc->sectors_per_block);
 	dc->lblocks = data_size;
 
-	data_size = i_size_read(da.data_dev->bdev->bd_inode) >> SECTOR_SHIFT;
+	data_size = bdev_nr_sectors(da.data_dev->bdev);
 	(void) sector_div(data_size, dc->sectors_per_block);
 	dc->pblocks = data_size;
 
@@ -679,14 +723,17 @@ static int dm_dedup_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		iparam_inram.blocks = dc->pblocks;
 		iparam = &iparam_inram;
 		break;
+#ifdef CONFIG_DM_DEDUP_COWBTREE
 	case BKND_COWBTREE:
 		dc->mdops = &metadata_ops_cowbtree;
 		iparam_cowbtree.blocks = dc->pblocks;
 		iparam_cowbtree.metadata_bdev = da.meta_dev->bdev;
 		iparam = &iparam_cowbtree;
+		break;
+#endif
 	}
 
-	strcpy(dc->backend_str, da.backend_str);
+	strscpy(dc->backend_str, da.backend_str, MAX_BACKEND_NAME_LEN);
 
 	md = dc->mdops->init_meta(iparam, &unformatted);
 	if (IS_ERR(md)) {
@@ -756,7 +803,7 @@ static int dm_dedup_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	dc->overwrites = 0;
 	dc->newwrites = 0;
 
-	strcpy(dc->crypto_alg, da.hash_algo);
+	strscpy(dc->crypto_alg, da.hash_algo, CRYPTO_ALG_NAME_LEN);
 	dc->crypto_key_size = crypto_key_size;
 
 	dc->flushrq = da.flushrq;
@@ -803,12 +850,12 @@ static void dm_dedup_dtr(struct dm_target *ti)
 		ret = dc->mdops->set_private_data(dc->bmd, &data,
 				sizeof(struct on_disk_stats));
 		if (ret < 0)
-			DMERR("Failed to set the private data in superblock.");
+			pr_err("Failed to set the private data in superblock.");
 	}
 
 	ret = dc->mdops->flush_meta(dc->bmd);
 	if (ret < 0)
-		DMERR("Failed to flush the metadata to disk.");
+		pr_err("Failed to flush the metadata to disk.");
 
 	flush_workqueue(dc->workqueue);
 	destroy_workqueue(dc->workqueue);
@@ -896,8 +943,8 @@ static int cleanup_hash_pbn(void *key, int32_t ksize, void *value,
 
 out_dec_refcount:
 	dc->kvs_hash_pbn->kvs_insert(dc->kvs_hash_pbn, key,
-			ksize, (void *)&hashpbn_value,
-			sizeof(hashpbn_value));
+					ksize, (void *)&hashpbn_value,
+					sizeof(hashpbn_value));
 out:
 	return r;
 }
@@ -916,7 +963,7 @@ static int garbage_collect(struct dedup_config *dc)
 }
 
 static int dm_dedup_message(struct dm_target *ti,
-			    unsigned argc, char **argv)
+			    unsigned argc, char **argv, char *result, unsigned maxlen)
 {
 	int r = 0;
 
@@ -925,7 +972,7 @@ static int dm_dedup_message(struct dm_target *ti,
 	if (!strcasecmp(argv[0], "garbage_collect")) {
 		r = garbage_collect(dc);
 		if (r < 0)
-			DMERR("Error in performing garbage_collect: %d.", r);
+			pr_err("Error in performing garbage_collect: %d.", r);
 	} else if (!strcasecmp(argv[0], "drop_bufio_cache")) {
 		if (dc->mdops->flush_bufio_cache)
 			dc->mdops->flush_bufio_cache(dc->bmd);

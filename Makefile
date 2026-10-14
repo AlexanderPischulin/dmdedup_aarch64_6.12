@@ -1,8 +1,9 @@
 obj-m += dm-dedup.o
 
-dm-dedup-objs := dm-dedup-cbt.o dm-dedup-hash.o dm-dedup-ram.o  dm-dedup-rw.o dm-dedup-target.o
-
-EXTRA_CFLAGS := -Idrivers/md
+# Phase 2: INRAM + COWBTREE backends
+dm-dedup-objs := dm-dedup-hash.o dm-dedup-ram.o dm-dedup-rw.o dm-dedup-target.o dm-dedup-cbt.o
+EXTRA_CFLAGS += -DCONFIG_DM_DEDUP_COWBTREE=1
+EXTRA_CFLAGS += -I/lib/modules/$(shell uname -r)/build/drivers/md
 
 all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules

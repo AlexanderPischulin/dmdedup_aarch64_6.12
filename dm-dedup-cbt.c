@@ -11,6 +11,7 @@
  */
 
 #include <linux/errno.h>
+#include <linux/dynamic_debug.h>
 #include "persistent-data/dm-btree.h"
 #include "persistent-data/dm-space-map.h"
 #include "persistent-data/dm-space-map-disk.h"
@@ -21,16 +22,16 @@
 #include "dm-dedup-backend.h"
 #include "dm-dedup-kvstore.h"
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #define EMPTY_ENTRY -5
 #define DELETED_ENTRY -6
 
 #define UINT32_MAX	(4294967295U)
 
 #define METADATA_BSIZE 4096
-#define METADATA_CACHESIZE 64  /* currently block manager ignores this value */
 #define METADATA_MAXLOCKS 5
 #define METADATA_SUPERBLOCK_LOCATION 0
-#define PRIVATE_DATA_SIZE 16
 
 struct metadata {
 	struct dm_block_manager *meta_bm;
@@ -43,8 +44,6 @@ struct metadata {
 	 */
 	struct kvstore_cbt *kvs_linear;
 	struct kvstore_cbt *kvs_sparse;
-
-	uint8_t private_data[PRIVATE_DATA_SIZE];
 };
 
 struct kvstore_cbt {
@@ -71,7 +70,6 @@ struct metadata_superblock {
 	__le64 hash_pbn_root; /* hash pbn btree root. */
 	__le32 data_block_size;	/* In bytes */
 	__le32 metadata_block_size; /* In bytes */
-	__u8 private_data[PRIVATE_DATA_SIZE]; /* Dmdedup counters */
 	__le64 metadata_nr_blocks;/* Number of metadata blocks used. */
 } __packed;
 
@@ -93,8 +91,6 @@ static int __begin_transaction(struct metadata *md)
 
 	if (md->kvs_sparse)
 		md->kvs_sparse->root = le64_to_cpu(disk_super->hash_pbn_root);
-
-	memcpy(md->private_data, disk_super->private_data, PRIVATE_DATA_SIZE);
 
 	dm_bm_unlock(sblock);
 
@@ -148,8 +144,6 @@ static int __commit_transaction(struct metadata *md)
 			    data_len);
 	if (r < 0)
 		goto out_locked;
-
-	memcpy(disk_super->private_data, md->private_data, PRIVATE_DATA_SIZE);
 
 	r = dm_tm_commit(md->tm, sblock);
 
@@ -232,7 +226,8 @@ static int superblock_all_zeroes(struct dm_block_manager *bm, bool *result)
 		}
 	}
 
-	return dm_bm_unlock(b);
+	dm_bm_unlock(b);
+	return 0;
 }
 
 static struct metadata *init_meta_cowbtree(void *input_param, bool *unformatted)
@@ -246,14 +241,14 @@ static struct metadata *init_meta_cowbtree(void *input_param, bool *unformatted)
 	struct init_param_cowbtree *p =
 				(struct init_param_cowbtree *)input_param;
 
-	DMINFO("Initializing COWBTREE backend");
+	pr_debug("Initializing COWBTREE backend");
 
 	md = kzalloc(sizeof(*md), GFP_NOIO);
 	if (!md)
 		return ERR_PTR(-ENOMEM);
 
 	meta_bm = dm_block_manager_create(p->metadata_bdev, METADATA_BSIZE,
-					  METADATA_CACHESIZE, METADATA_MAXLOCKS);
+					  METADATA_MAXLOCKS);
 	if (IS_ERR(meta_bm)) {
 		md = (struct metadata *)meta_bm;
 		goto badbm;
@@ -274,7 +269,7 @@ static struct metadata *init_meta_cowbtree(void *input_param, bool *unformatted)
 		ret = dm_bm_read_lock(meta_bm, METADATA_SUPERBLOCK_LOCATION,
 				      NULL, &sblock);
 		if (ret < 0) {
-			DMERR("could not read_lock superblock");
+			pr_err("could not read_lock superblock");
 			/* XXX: handle error */
 		}
 
@@ -285,7 +280,7 @@ static struct metadata *init_meta_cowbtree(void *input_param, bool *unformatted)
 					 sizeof(disk_super->metadata_space_map_root),
 					 &md->tm, &md->meta_sm);
 		if (ret < 0) {
-			DMERR("could not open_with_sm superblock");
+			pr_err("could not open_with_sm superblock");
 			/* XXX: handle error */
 		}
 
@@ -293,7 +288,7 @@ static struct metadata *init_meta_cowbtree(void *input_param, bool *unformatted)
 		md->data_sm = dm_sm_disk_open(md->tm, disk_super->data_space_map_root,
 					      sizeof(disk_super->data_space_map_root));
 		if (IS_ERR(md->data_sm)) {
-			DMERR("dm_disk_open failed");
+			pr_err("dm_disk_open failed");
 			/*XXX: handle error */
 		}
 
@@ -356,7 +351,7 @@ static void exit_meta_cowbtree(struct metadata *md)
 
 	ret = __commit_transaction(md);
 	if (ret < 0)
-		DMWARN("%s: __commit_transaction() failed, error = %d.",
+		pr_warn("%s: __commit_transaction() failed, error = %d.",
 			__func__, ret);
 
 	dm_sm_destroy(md->data_sm);
@@ -684,6 +679,42 @@ repeat:
 	}
 }
 
+/********************************************************
+ *		Sparse KVS Iterate (Garbage Collection)	 *
+ ********************************************************/
+
+struct iterate_context {
+	int (*fn)(void *key, int32_t ksize, void *value, int32_t vsize, void *data);
+	void *data;
+	uint32_t ksize;
+	uint32_t vsize;
+};
+
+static int iterate_callback(void *context, uint64_t *keys, void *leaf)
+{
+	struct iterate_context *ctx = context;
+	char *entry = leaf;  /* leaf = key + value concatenated (sparse KVS format) */
+
+	/* Call the real callback with split key/value */
+	return ctx->fn(entry, ctx->ksize, entry + ctx->ksize, ctx->vsize, ctx->data);
+}
+
+static int kvs_iterate_sparse_cowbtree(struct kvstore *kvs,
+    int (*fn)(void *key, int32_t ksize, void *value, int32_t vsize, void *data),
+    void *data)
+{
+	struct kvstore_cbt *kvcbt = container_of(kvs, struct kvstore_cbt, ckvs);
+	struct iterate_context ctx = {
+		.fn = fn,
+		.data = data,
+		.ksize = kvs->ksize,
+		.vsize = kvs->vsize,
+	};
+
+	/* Walk the btree, calling iterate_callback for each entry */
+	return dm_btree_walk(&(kvcbt->info), kvcbt->root, iterate_callback, &ctx);
+}
+
 static struct kvstore *kvs_create_sparse_cowbtree(struct metadata *md,
 			uint32_t ksize, uint32_t vsize, uint32_t knummax,
 			bool unformatted)
@@ -718,7 +749,7 @@ static struct kvstore *kvs_create_sparse_cowbtree(struct metadata *md,
 		kvs->ckvs.kvs_insert = kvs_insert_sparse_cowbtree;
 		kvs->ckvs.kvs_lookup = kvs_lookup_sparse_cowbtree;
 		kvs->ckvs.kvs_delete = kvs_delete_sparse_cowbtree;
-		kvs->ckvs.kvs_iterate = NULL;
+		kvs->ckvs.kvs_iterate = kvs_iterate_sparse_cowbtree;
 
 		md->kvs_sparse = kvs;
 		__begin_transaction(md);
@@ -735,7 +766,7 @@ static struct kvstore *kvs_create_sparse_cowbtree(struct metadata *md,
 		kvs->ckvs.kvs_insert = kvs_insert_sparse_cowbtree;
 		kvs->ckvs.kvs_lookup = kvs_lookup_sparse_cowbtree;
 		kvs->ckvs.kvs_delete = kvs_delete_sparse_cowbtree;
-		kvs->ckvs.kvs_iterate = NULL;
+		kvs->ckvs.kvs_iterate = kvs_iterate_sparse_cowbtree;
 
 		md->kvs_sparse = kvs;
 	}
@@ -745,24 +776,6 @@ static struct kvstore *kvs_create_sparse_cowbtree(struct metadata *md,
 badtree:
 	kfree(kvs);
 	return (struct kvstore *) kvs;
-}
-
-int get_private_data_cowbtree(struct metadata *md, void **data, uint32_t size)
-{
-	if(size > sizeof(md->private_data))
-		return -1;
-
-	memcpy(*data, md->private_data, size);
-	return 0;
-}
-
-int set_private_data_cowbtree(struct metadata *md, void *data, uint32_t size)
-{
-	if(size > sizeof(md->private_data))
-		return -1;
-
-	memcpy(md->private_data, data, size);
-	return 0;
 }
 
 struct metadata_ops metadata_ops_cowbtree = {
@@ -779,6 +792,4 @@ struct metadata_ops metadata_ops_cowbtree = {
 	.flush_meta = flush_meta_cowbtree,
 
 	.flush_bufio_cache = NULL,
-	.get_private_data = get_private_data_cowbtree,
-	.set_private_data = set_private_data_cowbtree,
 };

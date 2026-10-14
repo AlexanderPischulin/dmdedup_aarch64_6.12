@@ -12,10 +12,13 @@
 
 #include <linux/vmalloc.h>
 #include <linux/errno.h>
+#include <linux/dynamic_debug.h>
 
 #include "dm-dedup-kvstore.h"
 #include "dm-dedup-ram.h"
 #include "dm-dedup-backend.h"
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #define EMPTY_ENTRY -5
 #define DELETED_ENTRY -6
@@ -48,7 +51,7 @@ static struct metadata *init_meta_inram(void *init_param, bool *unformatted)
 	struct metadata *md;
 	struct init_param_inram *p = (struct init_param_inram *)init_param;
 
-	DMINFO("Initializing INRAM backend");
+	pr_debug("Initializing INRAM backend");
 
 	*unformatted = true;
 
@@ -66,7 +69,7 @@ static struct metadata *init_meta_inram(void *init_param, bool *unformatted)
 
 	tmp = smap_size;
 	(void) do_div(tmp, (1024 * 1024));
-	DMINFO("Space allocated for pbn reference count map: %llu.%06llu MB\n",
+	pr_debug("Space allocated for pbn reference count map: %llu.%06llu MB\n",
 	       tmp, smap_size - (tmp * (1024 * 1024)));
 
 	memset(md->smap, 0, smap_size);
@@ -98,7 +101,6 @@ static void exit_meta_inram(struct metadata *md)
 
 	kfree(md);
 }
-
 
 static int flush_meta_inram(struct metadata *md)
 {
@@ -178,7 +180,7 @@ static int is_empty(char *ptr, int length)
 {
 	int i = 0;
 
-	while ((i < length) && (ptr[i] == EMPTY_ENTRY))
+	while ((i < length) && ((unsigned char)ptr[i] == (unsigned char)EMPTY_ENTRY))
 		i++;
 
 	return i == length;
@@ -188,7 +190,7 @@ static int is_deleted(char *ptr, int length)
 {
 	int i = 0;
 
-	while ((i < length) && (ptr[i] == DELETED_ENTRY))
+	while ((i < length) && ((unsigned char)ptr[i] == (unsigned char)DELETED_ENTRY))
 		i++;
 
 	return i == length;
@@ -231,7 +233,7 @@ static int kvs_delete_linear_inram(struct kvstore *kvs,
  * < 0 - error on lookup
  */
 static int kvs_lookup_linear_inram(struct kvstore *kvs, void *key,
-			int32_t ksize, void *value, int32_t *vsize)
+				int32_t ksize, void *value, int32_t *vsize)
 {
 	uint64_t idx;
 	char *ptr;
@@ -293,7 +295,7 @@ static int kvs_insert_linear_inram(struct kvstore *kvs, void *key,
  */
 static int kvs_iterate_linear_inram(struct kvstore *kvs,
 		int (*iteration_action)(void *key, int32_t ksize,
-		void *value, int32_t vsize, void *data), void *data)
+				void *value, int32_t vsize, void *data), void *data)
 {
 	int ret = 0;
 	uint64_t i = 0;
@@ -350,7 +352,7 @@ static struct kvstore *kvs_create_linear_inram(struct metadata *md,
 
 	tmp = kvstore_size;
 	(void) do_div(tmp, (1024 * 1024));
-	DMINFO("Space allocated for linear key value store: %llu.%06llu MB\n",
+	pr_debug("Space allocated for linear key value store: %llu.%06llu MB\n",
 	       tmp, kvstore_size - (tmp * (1024 * 1024)));
 
 	memset(kvs->store, EMPTY_ENTRY, kvstore_size);
@@ -441,7 +443,6 @@ static int kvs_lookup_sparse_inram(struct kvstore *kvs, void *key,
 			memcpy(value, ptr + kvs->ksize, kvs->vsize);
 			return 1;
 		}
-
 	} while (head != tail);
 
 	return 0;
@@ -476,7 +477,6 @@ static int kvs_insert_sparse_inram(struct kvstore *kvs, void *key,
 		}
 
 		head = next_head(head, kvinram->kmax);
-
 	} while (head != tail);
 
 	return -ENOSPC;
@@ -490,7 +490,7 @@ static int kvs_insert_sparse_inram(struct kvstore *kvs, void *key,
  */
 static int kvs_iterate_sparse_inram(struct kvstore *kvs,
 		int (*iteration_action)(void *key, int32_t ksize,
-		void *value, int32_t vsize, void *data), void *data)
+				void *value, int32_t vsize, void *data), void *data)
 {
 	int err = 0;
 	uint32_t kvalue_size, head = 0;
@@ -507,7 +507,7 @@ static int kvs_iterate_sparse_inram(struct kvstore *kvs,
 		ptr = kvinram->store + (head * kvalue_size);
 
 		if (!is_empty(ptr, kvalue_size) &&
-			!is_deleted(ptr, kvalue_size)) {
+		    !is_deleted(ptr, kvalue_size)) {
 			err = iteration_action((void *)ptr, kvs->ksize,
 					(void *)(ptr + kvs->ksize),
 					kvs->vsize, data);
@@ -553,7 +553,7 @@ static struct kvstore *kvs_create_sparse_inram(struct metadata *md,
 
 	tmp = kvstore_size;
 	(void) do_div(tmp, (1024 * 1024));
-	DMINFO("Space allocated for sparse key value store: %llu.%06llu MB\n",
+	pr_debug("Space allocated for sparse key value store: %llu.%06llu MB\n",
 	       tmp, kvstore_size - (tmp * (1024 * 1024)));
 
 	memset(kvs->store, EMPTY_ENTRY, kvstore_size);

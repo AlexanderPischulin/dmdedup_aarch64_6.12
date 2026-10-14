@@ -29,19 +29,15 @@
 #include <linux/parser.h>
 #include <linux/blk_types.h>
 #include <linux/mempool.h>
+#include <linux/blkdev.h>
 
 #include <linux/scatterlist.h>
 #include <asm/page.h>
-#include <asm/unaligned.h>
-#include <crypto/hash.h>
-#include <crypto/md5.h>
-#include <crypto/sha.h>
-#include <crypto/algapi.h>
 
 #define DM_MSG_PREFIX "dedup-mod"
 
 #define CRYPTO_ALG_NAME_LEN     16
-#define MAX_DIGEST_SIZE	SHA256_DIGEST_SIZE
+#define MAX_DIGEST_SIZE	64
 
 #define MAX_BACKEND_NAME_LEN (64)
 

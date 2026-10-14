@@ -25,13 +25,6 @@
 #include <linux/string.h>
 #include <linux/gfp.h>
 
-#include <linux/scatterlist.h>
-#include <asm/page.h>
-#include <asm/unaligned.h>
-#include <crypto/hash.h>
-#include <crypto/md5.h>
-#include <crypto/algapi.h>
-
 #include "dm-dedup-target.h"
 
 extern struct metadata_ops metadata_ops_inram;

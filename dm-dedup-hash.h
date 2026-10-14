@@ -13,10 +13,12 @@
 #ifndef DM_DEDUP_HASH_H
 #define DM_DEDUP_HASH_H
 
+#include <crypto/hash.h>
+
 #define DEDUP_HASH_DESC_COUNT 128
 
 struct hash_desc_table {
-	struct hash_desc desc[DEDUP_HASH_DESC_COUNT];
+	struct crypto_shash *tfm[DEDUP_HASH_DESC_COUNT];
 	bool free_bitmap[DEDUP_HASH_DESC_COUNT];
 	atomic_long_t slot_counter;
 } /*desc_table*/;

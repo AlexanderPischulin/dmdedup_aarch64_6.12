@@ -14,29 +14,24 @@
 #include "dm-dedup-hash.h"
 #include <linux/atomic.h>
 #include <linux/blk_types.h>
+#include <linux/crypto.h>
+#include <linux/scatterlist.h>
+#include <linux/highmem.h>
 
 /*
- * We are declaring and initalizaing global hash_desc, because
- * we need to do hash computation in endio function, and this
- * function is called in softirq context. Hence we are not
- * allowed to perform any operation on that path which can sleep.
- * And tfm allocation in hash_desc, at one point, tries to take
- * semaphore and hence tries to sleep. And because of this we get
- * BUG, which complains "Scheduling while atomic". Hence to avoid
- * this scenario, we moved the declaration and initialization out
- * of critical path.
+ * We pre-allocate crypto_shash tfm per slot to avoid allocation
+ * in the critical path (which may sleep).
  */
-static struct hash_desc *slot_to_desc(struct hash_desc_table *desc_table,
-							unsigned long slot)
+static struct crypto_shash *slot_to_tfm(struct hash_desc_table *desc_table,
+					 unsigned long slot)
 {
 	BUG_ON(slot >= DEDUP_HASH_DESC_COUNT);
-	return &(desc_table->desc[slot]);
+	return desc_table->tfm[slot];
 }
 
 struct hash_desc_table *desc_table_init(char *hash_alg)
 {
 	int i = 0;
-	struct hash_desc *desc;
 	struct hash_desc_table *desc_table;
 
 	desc_table = kmalloc(sizeof(struct hash_desc_table), GFP_NOIO);
@@ -45,11 +40,9 @@ struct hash_desc_table *desc_table_init(char *hash_alg)
 
 	for (i = 0; i < DEDUP_HASH_DESC_COUNT; i++) {
 		desc_table->free_bitmap[i] = true;
-		desc = &desc_table->desc[i];
-		desc->flags = 0;
-		desc->tfm = crypto_alloc_hash(hash_alg, 0, CRYPTO_ALG_ASYNC);
-		if (IS_ERR(desc->tfm))
-			return (struct hash_desc_table *)desc->tfm;
+		desc_table->tfm[i] = crypto_alloc_shash(hash_alg, 0, 0);
+		if (IS_ERR(desc_table->tfm[i]))
+			return (struct hash_desc_table *)desc_table->tfm[i];
 	}
 
 	atomic_long_set(&(desc_table->slot_counter), 0);
@@ -60,11 +53,9 @@ struct hash_desc_table *desc_table_init(char *hash_alg)
 void desc_table_deinit(struct hash_desc_table *desc_table)
 {
 	int i = 0;
-	struct hash_desc *desc;
 
 	for (i = 0; i < DEDUP_HASH_DESC_COUNT; i++) {
-		desc = desc_table->desc + i;
-		crypto_free_hash(desc->tfm);
+		crypto_free_shash(desc_table->tfm[i]);
 	}
 
 	kfree(desc_table);
@@ -106,40 +97,52 @@ static void put_slot(struct hash_desc_table *desc_table, unsigned long slot)
 unsigned int get_hash_digestsize(struct hash_desc_table *desc_table)
 {
 	unsigned long slot;
-	struct hash_desc *desc;
+	struct crypto_shash *tfm;
 
 	slot = get_next_slot(desc_table);
-	desc = slot_to_desc(desc_table, slot);
+	tfm = slot_to_tfm(desc_table, slot);
 
-	return crypto_hash_digestsize(desc->tfm);
+	return crypto_shash_digestsize(tfm);
 }
 
 int compute_hash_bio(struct hash_desc_table *desc_table,
-				struct bio *bio, char *hash)
+			struct bio *bio, char *hash)
 {
-	struct scatterlist sg;
+	struct shash_desc *desc;
 	int ret = 0;
 	unsigned long slot;
 	struct bio_vec bvec;
 	struct bvec_iter iter;
-	struct hash_desc *desc;
+	struct crypto_shash *tfm;
+	unsigned int desc_size;
 
 	slot = get_next_slot(desc_table);
-	desc = slot_to_desc(desc_table, slot);
+	tfm = slot_to_tfm(desc_table, slot);
 
-	ret = crypto_hash_init(desc);
+	desc_size = crypto_shash_descsize(tfm) + sizeof(*desc);
+	desc = kmalloc(desc_size, GFP_NOIO);
+	if (!desc) {
+		put_slot(desc_table, slot);
+		return -ENOMEM;
+	}
+
+	desc->tfm = tfm;
+
+	ret = crypto_shash_init(desc);
 	if (ret)
 		goto out;
 
-	sg_init_table(&sg, 1);
 	__bio_for_each_segment(bvec, bio, iter, bio->bi_iter) {
-		sg_set_page(&sg, bvec.bv_page, bvec.bv_len,
-			    bvec.bv_offset);
-		crypto_hash_update(desc, &sg, sg.length);
+		void *addr = page_address(bvec.bv_page) + bvec.bv_offset;
+		ret = crypto_shash_update(desc, addr, bvec.bv_len);
+		if (ret)
+			goto out;
 	}
 
-	crypto_hash_final(desc, hash);
+	ret = crypto_shash_final(desc, hash);
+
 out:
+	kfree(desc);
 	put_slot(desc_table, slot);
 	return ret;
 }
